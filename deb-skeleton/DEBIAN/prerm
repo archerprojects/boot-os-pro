@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        # -x matches the process NAME exactly. -f would substring-match the
+        # full command line and kill this very script
+        # (/var/lib/dpkg/info/bootospro.prerm) mid-removal.
+        pkill -x bootospro || true
+        ;;
+esac
+
+exit 0

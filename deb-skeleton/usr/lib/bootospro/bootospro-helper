@@ -1,0 +1,41 @@
+#!/bin/bash
+# bootospro-helper — privileged helper for Boot OS Pro
+# Invoked via pkexec. Validates the command before executing.
+# Policy: /usr/share/polkit-1/actions/dev.bootospro.app.policy
+
+set -euo pipefail
+
+# NOTE: `sh` is deliberately NOT in this list — allowing `sh -c` as a helper
+# command makes the entire allowlist decorative (arbitrary root shell). The
+# in-chroot `chroot <root> sh -c ...` calls are unaffected: there the helper
+# command is `chroot`, and sh is just an argument to it.
+ALLOWED_CMDS=(dd rm sfdisk mkfs.fat mkfs.exfat mkfs.ext4 mkfs.ntfs mount umount blockdev partprobe wipefs udevadm blkid mkdir chmod chown cp sync grub-install grub2-install unsquashfs chroot useradd usermod chpasswd)
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: bootospro-helper <command> [args...]" >&2
+    exit 1
+fi
+
+CMD="$1"
+shift
+
+ALLOWED=0
+for c in "${ALLOWED_CMDS[@]}"; do
+    if [[ "$CMD" == "$c" ]]; then
+        ALLOWED=1
+        break
+    fi
+done
+
+if [[ $ALLOWED -eq 0 ]]; then
+    echo "bootospro-helper: command not allowed: $CMD" >&2
+    exit 1
+fi
+
+CMD_PATH="$(command -v "$CMD" 2>/dev/null || true)"
+if [[ -z "$CMD_PATH" ]]; then
+    echo "bootospro-helper: command not found: $CMD" >&2
+    exit 1
+fi
+
+exec "$CMD_PATH" "$@"

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Boot OS Pro
+GenericName=Multiboot USB Creator
+Comment=Create multiboot USB drives with persistent storage
+Exec=bootospro
+Icon=bootospro
+Terminal=false
+Categories=X-LEAN-Files;System;FileManager;
+Keywords=usb;boot;iso;multiboot;live;persistent;grub;
+StartupNotify=false
+StartupWMClass=bootospro
+MimeType=application/x-iso9660-image;

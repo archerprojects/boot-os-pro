@@ -1,0 +1,24 @@
+Package: bootospro
+Version: 0.1.1
+Architecture: amd64
+Maintainer: archerprojects <archer.projects@proton.me>
+Installed-Size: 15000
+Depends: libc6 (>= 2.39), libwebkit2gtk-4.1-0, libgtk-3-0, grub2-common | grub-common, grub-efi-amd64-bin, grub-pc-bin, dosfstools, exfatprogs | exfat-utils, util-linux, e2fsprogs, ntfs-3g, squashfs-tools, parted, udev, polkitd | policykit-1, pkexec | policykit-1
+Section: utils
+Priority: optional
+Homepage: https://github.com/archerprojects/boot-os-pro
+Description: Boot OS Pro — Multiboot USB Creator with Persistent Storage
+ Boot OS Pro is a desktop application for creating multiboot USB drives
+ that boot via GRUB2 on both legacy BIOS and EFI machines. Each persistent
+ OS is extracted into its own dedicated ext4 partition for universal,
+ distro-independent persistence, while a shared free space partition holds
+ live-session ISOs that boot via loopback.
+ .
+ Features:
+  - GRUB2 installation for EFI (x86_64) and legacy BIOS (i386-pc)
+  - Per-ISO dedicated ext4 partition with the OS extracted at write time
+  - Universal persistence — no casper-rw overlay, no distro-specific hooks
+  - Multiple live-session ISOs in a shared free space partition
+  - Self-describing drive via an on-EFI manifest
+  - Disk Manager: per-partition format, delete, safe whole-device wipe
+  - Live write progress with cancellation support

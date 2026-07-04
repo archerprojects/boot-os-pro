@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<policyconfig>
+
+  <vendor>Boot OS Pro</vendor>
+  <vendor_url>https://bootospro.dev</vendor_url>
+
+  <action id="dev.bootospro.app.run-helper">
+    <description>Run Boot OS Pro disk operations</description>
+    <message>Boot OS Pro needs administrator privileges to write to the USB drive.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/bootospro/bootospro-helper</annotate>
+  </action>
+
+</policyconfig>

@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        chmod 755 /usr/bin/bootospro
+        chmod 755 /usr/lib/bootospro/bootospro-helper
+        chown root:root /usr/lib/bootospro/bootospro-helper
+
+        if command -v pkaction >/dev/null 2>&1; then
+            if systemctl is-active --quiet polkit 2>/dev/null; then
+                systemctl reload-or-restart polkit || true
+            fi
+        fi
+
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+        gtk-update-icon-cache -f -t /usr/share/icons/lean-icons 2>/dev/null || true
+
+        echo "Boot OS Pro installed. Launch from your application menu or run:"
+        echo "  bootospro"
+        ;;
+esac
+
+exit 0

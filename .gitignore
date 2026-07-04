@@ -1,0 +1,14 @@
+# Build outputs
+dist/
+src-tauri/target/
+
+# Tauri generated schemas — regenerated on every build
+src-tauri/gen/
+
+# Dependencies
+node_modules/
+
+# Tracked on purpose (do NOT ignore):
+#   .build_counter    — project version state; ignoring it restarts numbering
+#   Cargo.lock        — reproducible Rust builds
+#   package-lock.json — reproducible npm builds
