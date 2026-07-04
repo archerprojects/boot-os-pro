@@ -28,7 +28,7 @@ Boot OS Pro writes a structured, self-describing multiboot drive. Each ISO you a
 
 | | | |
 |---|---|---|
-| ![Select drive](screenshots/select-drive.jpg) | ![Configure drive](screenshots/configure-drive.jpg) | ![Disk Manager](screenshots/disk-manager.jpg) |
+| ![Select drive](screenshots/boot1.jpg) | ![Configure drive](screenshots/boot2.jpg) | ![Disk Manager](screenshots/boot3.jpg) |
 | Select Drive | Configure | Disk Manager |
 
 ---
