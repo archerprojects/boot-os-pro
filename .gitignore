@@ -1,3 +1,5 @@
+# Boot OS Pro — .gitignore — build 1.0.2 — Monday 9 November 2026
+
 # Build outputs
 dist/
 src-tauri/target/

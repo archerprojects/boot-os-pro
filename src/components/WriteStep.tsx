@@ -1,6 +1,8 @@
+// Boot OS Pro — WriteStep.tsx — build 1.0.2 — Monday 9 November 2026
+
 import { useEffect, useRef, useState } from 'react';
 import type { AppState, WriteProgressEvent } from '../lib/types';
-import { cancelOperation, onWriteProgress, runFullWrite, addPersistentIso, addLiveIso } from '../lib/api';
+import { cancelOperation, onWriteProgress, runFullWrite, addPersistentIso, addLiveIso, fillSlot } from '../lib/api';
 
 interface Props {
   state: AppState;
@@ -8,7 +10,9 @@ interface Props {
   onDone: () => void;
 }
 
-type WriteState = 'writing' | 'done' | 'error';
+// 'cancelling' keeps the progress screen up until the backend confirms the
+// write has stopped and cleaned up — never report "cancelled" before that.
+type WriteState = 'writing' | 'cancelling' | 'done' | 'error';
 
 interface LogLine {
   time: string;
@@ -54,6 +58,7 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
   const [error, setError]           = useState<string | null>(null);
   const [overallPct, setOverallPct] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
+  const cancelRequested = useRef(false);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -62,10 +67,11 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
       setProgress(evt);
       // calcOverall is a pure function — no stale closure over overallPct state
       setOverallPct(calcOverall(evt.stage, evt.pct));
-      // Streaming progress re-emits the same message with a new pct —
-      // move the bar, but don't repeat the log line.
+      // Streaming progress re-emits the same message with a new pct or new
+      // counts (MB copied, MB left) — move the bar, but log the step once.
+      const shape = (m: string) => m.replace(/\d+/g, '#');
       setLog(l =>
-        l.length > 0 && l[l.length - 1].msg === evt.msg
+        l.length > 0 && shape(l[l.length - 1].msg) === shape(evt.msg)
           ? l
           : [...l, { time: new Date().toLocaleTimeString(), msg: evt.msg }]
       );
@@ -78,12 +84,24 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
       try {
         if (isExisting) {
           const dev = state.device!.path;
-          for (const iso of state.isos) {
-            if (iso.iso_type === 'persistent') {
-              await addPersistentIso(dev, iso);
-            } else {
-              await addLiveIso(dev, iso);
-            }
+          // Carved persistent adds first: each one re-creates the free space
+          // partition, which removes every live ISO in it. Installs into empty
+          // slots touch nothing else. Live ISOs queued this session are copied
+          // last so they survive.
+          const carved = state.isos.filter(i => i.iso_type === 'persistent' && !i.target_slot);
+          const fills  = state.isos.filter(i => i.iso_type === 'persistent' && !!i.target_slot);
+          const live   = state.isos.filter(i => i.iso_type === 'live');
+          for (const iso of carved) {
+            if (cancelRequested.current) break;
+            await addPersistentIso(dev, iso);
+          }
+          for (const iso of fills) {
+            if (cancelRequested.current) break;
+            await fillSlot(dev, iso.target_slot, iso);
+          }
+          for (const iso of live) {
+            if (cancelRequested.current) break;
+            await addLiveIso(dev, iso);
           }
         } else {
           await runFullWrite(
@@ -93,10 +111,15 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
             state.free_space_gb,
           );
         }
+        if (cancelRequested.current) throw new Error('Operation cancelled');
         setOverallPct(100);
         setWriteState('done');
       } catch (e) {
-        setError(String(e));
+        setError(cancelRequested.current
+          ? (isExisting
+              ? 'Cancelled. The write has stopped and the drive is safe to remove. Items added before the cancel are kept; the one in progress was not added.'
+              : 'Cancelled. The write has stopped and the drive is safe to remove. The drive is incomplete and will not boot — write it again or wipe it in Disk Manager.')
+          : String(e));
         setWriteState('error');
       }
     };
@@ -105,14 +128,17 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
     return () => { unlisten?.(); };
   }, []);
 
+  // Ask the backend to stop. The screen stays on "Cancelling…" until the
+  // write command itself returns — that is when it has really stopped.
   const handleCancel = async () => {
-    await cancelOperation();
-    setWriteState('error');
-    setError('Cancelled by user.');
+    cancelRequested.current = true;
+    setWriteState('cancelling');
+    await cancelOperation().catch(() => {});
   };
 
   // ── Writing ────────────────────────────────────────────────────────────────
-  if (writeState === 'writing') {
+  if (writeState === 'writing' || writeState === 'cancelling') {
+    const cancelling = writeState === 'cancelling';
     const stageLabel = progress
       ? (STAGE_LABELS[progress.stage] ?? progress.stage)
       : 'Starting…';
@@ -120,8 +146,10 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
     return (
       <div className="step-layout">
         <div className="step-header">
-          <h1>Writing…</h1>
-          <p>Do not remove the USB drive. Extraction may take several minutes per ISO.</p>
+          <h1>{cancelling ? 'Cancelling…' : 'Writing…'}</h1>
+          <p>{cancelling
+            ? 'Waiting for the current step to stop. Do not remove the USB drive yet.'
+            : 'Do not remove the USB drive. Extraction may take several minutes per ISO.'}</p>
         </div>
 
         <div className="card">
@@ -148,7 +176,9 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
         </div>
 
         <div className="action-bar">
-          <button className="btn btn-danger" onClick={handleCancel}>✕ Cancel</button>
+          <button className="btn btn-danger" onClick={handleCancel} disabled={cancelling}>
+            {cancelling ? 'Cancelling…' : '✕ Cancel'}
+          </button>
         </div>
       </div>
     );
@@ -185,7 +215,7 @@ export function WriteStep({ state, isExisting, onDone }: Props) {
   return (
     <div className="step-layout center-content">
       <div className="error-icon">✕</div>
-      <h1>Write failed</h1>
+      <h1>{cancelRequested.current ? 'Write cancelled' : 'Write failed'}</h1>
       <p className="error-msg">{error}</p>
       <div className="action-bar" style={{ justifyContent: 'center' }}>
         <button className="btn btn-primary" onClick={onDone}>← Start over</button>

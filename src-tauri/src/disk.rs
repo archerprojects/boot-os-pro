@@ -1,10 +1,10 @@
+// Boot OS Pro — disk.rs — build 1.0.2 — Monday 9 November 2026
+
 extern crate libc;
 
 use crate::error::{BootOsProError, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-
-const HELPER: &str = "/usr/lib/bootospro/bootospro-helper";
 
 // ── Data structures ────────────────────────────────────────────────────────
 
@@ -152,6 +152,9 @@ pub fn get_partition_layout(dev: &str) -> Result<BlockDevice> {
 
 // ── Partition management ───────────────────────────────────────────────────
 
+/// Size of the BOOTOSPRO installer partition on new drives.
+pub const INSTALLER_MIB: u64 = 256;
+
 fn get_total_sectors(dev: &str) -> Result<u64> {
     let output = Command::new("lsblk")
         .args(["--bytes", "--nodeps", "--noheadings", "--output", "SIZE", dev])
@@ -173,32 +176,29 @@ fn get_total_sectors(dev: &str) -> Result<u64> {
 }
 
 fn unmount_all(dev: &str) {
-    // Pass 1: unmount by mountpoint via lsblk
-    let output = Command::new("lsblk")
-        .args(["--noheadings", "--list", "--output", "PATH,MOUNTPOINT", dev])
-        .output();
+    // Read the device's real partitions and mount points from lsblk JSON —
+    // mount points are taken whole (desktop mounts often contain spaces) and
+    // every partition is covered, however many there are.
+    let (mounts, parts) = match get_partition_layout(dev) {
+        Ok(layout) => (
+            layout.children.iter()
+                .filter_map(|p| p.mountpoint.clone())
+                .filter(|m| !m.is_empty() && m != "/")
+                .collect::<Vec<_>>(),
+            layout.children.iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
+        ),
+        Err(_) => (Vec::new(), Vec::new()),
+    };
 
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let mnt = parts[1];
-                if !mnt.is_empty() && mnt != "/" {
-                    let _ = run_privileged("umount", &["-f", mnt]);
-                }
-            }
-        }
+    // Pass 1: unmount by mount point.
+    for mnt in &mounts {
+        let _ = run_privileged("umount", &["-f", mnt]);
     }
 
-    // Pass 2: direct umount -f on each partition path — catches stale mounts.
-    // Range covers BIOS/EFI/installer/free plus several ISO partitions.
-    for n in 1..=12 {
-        for part in [format!("{dev}{n}"), format!("{dev}p{n}")] {
-            if std::path::Path::new(&part).exists() {
-                let _ = run_privileged("umount", &["-f", &part]);
-            }
-        }
+    // Pass 2: unmount each partition by device path — catches stale mounts
+    // lsblk did not report.
+    for part in &parts {
+        let _ = run_privileged("umount", &["-f", part]);
     }
 
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -206,7 +206,7 @@ fn unmount_all(dev: &str) {
 
 /// Write a new partition table for a full first write.
 /// Layout: BIOS Boot(1) · EFI/ESP(2) · BOOTOSPRO installer(3) ·
-///         ext4 per persistent ISO (4..) · FREESPACE FAT32 (last).
+///         ext4 per persistent ISO or reserved slot (4..) · FREESPACE exFAT (last).
 pub fn partition_drive_full(
     dev: &str,
     iso_sizes_gb: &[u64],
@@ -215,10 +215,10 @@ pub fn partition_drive_full(
     let sec_start: u64 = 2048;
     let efi_sectors: u64 = 512 * 1024 * 1024 / 512;        // 512 MiB ESP
     let bios_overhead: u64 = 2048;                          // 1 MiB BIOS Boot
-    // 40 MiB cross-platform installer partition. FAT32, readable on Linux,
-    // Windows, and macOS. Holds the app's installer package(s) so the drive
-    // can install Boot OS Pro on any machine it is plugged into.
-    let installer_sectors: u64 = 40 * 1024 * 1024 / 512;
+    // 256 MiB cross-platform installer partition. FAT32, readable on Linux,
+    // Windows, and macOS. Holds the app copy (AppImage) and drivers so the
+    // drive can run Boot OS Pro on any machine it is plugged into.
+    let installer_sectors: u64 = INSTALLER_MIB * 1024 * 1024 / 512;
 
     let total_sectors = get_total_sectors(dev)?;
 
@@ -293,7 +293,7 @@ pub fn partition_drive_full(
         cursor += iso_sec;
     }
 
-    // last — free space partition (FAT32) for live-session ISOs
+    // last — free space partition (exFAT) for live-session ISOs
     if free_sectors > 0 {
         let free_idx = iso_sectors.len() + 4;
         script.push_str(&format!(
@@ -326,13 +326,21 @@ pub fn partition_drive_full(
     })
 }
 
-/// Carve a new ext4 persistent partition from the free space FAT32 partition.
+/// Result of carving a persistent partition out of the free space partition.
+/// The free space partition is re-created at a new start sector, so its old
+/// filesystem (and every live ISO in it) is gone — the caller must format
+/// `free_part` with `free_fstype` and clear the manifest's live records.
+pub struct CarveResult {
+    pub new_part: String,
+    pub free_part: Option<String>,
+    pub free_bytes: u64,
+    /// Filesystem the free space partition had before the carve (lsblk name).
+    pub free_fstype: String,
+}
+
+/// Carve a new ext4 persistent partition from the free space partition.
 /// Shrinks the free space partition and inserts a new ext4 partition before it.
-/// Returns the new partition path and the updated free space partition path.
-pub fn carve_persistent_from_free(
-    dev: &str,
-    new_iso_gb: u64,
-) -> Result<(String, Option<String>)> {
+pub fn carve_persistent_from_free(dev: &str, new_iso_gb: u64) -> Result<CarveResult> {
     let layout = get_partition_layout(dev)?;
 
     let free_part = layout.children.iter().find(|p| {
@@ -340,6 +348,7 @@ pub fn carve_persistent_from_free(
     }).ok_or_else(|| BootOsProError::Other("no free space partition found on drive".into()))?;
 
     let free_path = free_part.path.clone();
+    let free_fstype = free_part.fstype.clone();
     let free_num = partition_number(dev, &free_path)
         .ok_or_else(|| BootOsProError::Other("could not parse free space partition number".into()))?;
 
@@ -401,7 +410,22 @@ pub fn carve_persistent_from_free(
         None
     };
 
-    Ok((new_part, new_free))
+    Ok(CarveResult {
+        new_part,
+        free_part: new_free,
+        free_bytes: if has_remaining { remaining * 512 } else { 0 },
+        free_fstype,
+    })
+}
+
+/// Format a re-created free space partition with the filesystem it had
+/// before: FAT32 on drives made before 1.0.19, exFAT from 1.0.19 on.
+pub fn format_free_space_as(part: &str, fstype: &str) -> Result<()> {
+    if fstype.eq_ignore_ascii_case("vfat") {
+        format_partition(part, "fat32", "FREESPACE")
+    } else {
+        format_free_space(part)
+    }
 }
 
 /// Read a partition's (start_sector, size_sectors) from `sfdisk --dump`.
@@ -465,12 +489,14 @@ pub fn format_iso_partition(part: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Format the free space partition as exFAT: readable and writable on Linux,
+/// Windows and macOS, with no 4 GiB file limit for large live ISOs.
 pub fn format_free_space(part: &str) -> Result<()> {
-    run_privileged("mkfs.fat", &["-F", "32", "-n", "FREESPACE", part])?;
+    run_privileged("mkfs.exfat", &["-n", "FREESPACE", part])?;
     Ok(())
 }
 
-/// Format the 40 MiB cross-platform installer partition as FAT32.
+/// Format the cross-platform installer partition as FAT32.
 pub fn format_installer(part: &str) -> Result<()> {
     run_privileged("mkfs.fat", &["-F", "32", "-n", "BOOTOSPRO", part])?;
     Ok(())
@@ -519,7 +545,8 @@ pub fn mount_partition_fast(part: &str, mnt: &str) -> Result<()> {
     Ok(())
 }
 
-/// Mount a FAT32 partition with uid/gid options so current user can write.
+/// Mount a FAT32 or exFAT partition with uid/gid options so the current user
+/// can write.
 pub fn mount_partition_fat(part: &str, mnt: &str) -> Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
@@ -629,6 +656,18 @@ pub fn iso_volume_label(iso_path: &str) -> String {
     }
 }
 
+/// Read a partition's filesystem type via blkid, e.g. "vfat" or "exfat".
+/// Empty string if unreadable.
+pub fn partition_fstype(part: &str) -> String {
+    let out = Command::new("blkid")
+        .args(["-s", "TYPE", "-o", "value", part])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Read a partition's filesystem UUID via blkid. Empty string if none.
 /// Used by the manifest layer as the primary drift signal.
 pub fn partition_uuid(part: &str) -> String {
@@ -658,10 +697,7 @@ fn append_sfdisk_script(dev: &str, script: &str) -> Result<()> {
 }
 
 fn run_sfdisk_stdin(args: &[&str], script: &str) -> Result<()> {
-    let mut full_args = vec![HELPER, "sfdisk"];
-    full_args.extend_from_slice(args);
-    let mut child = Command::new("pkexec")
-        .args(&full_args)
+    let mut child = privileged_command("sfdisk", args)?
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -707,15 +743,12 @@ pub fn run_privileged_streaming(
 ) -> Result<()> {
     use std::io::{BufRead, BufReader, Read};
 
-    let mut full_args = vec![HELPER, cmd];
-    full_args.extend_from_slice(args);
-
-    let mut child = Command::new("pkexec")
-        .args(&full_args)
+    let mut child = privileged_command(cmd, args)?
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
+    let _running = RunningGuard::set(child.id());
 
     // Drain stderr concurrently — a blocked stderr pipe would stall the child.
     let stderr_handle = child.stderr.take().map(|mut e| {
@@ -746,10 +779,82 @@ pub fn run_privileged_streaming(
     Ok(())
 }
 
+// ── Cancellable long-running privileged commands ───────────────────────────
+//
+// Extraction (unsquashfs, cp -a) can run for half an hour. Its PID is recorded
+// while it runs so Cancel can stop it. Both run as children of the helper,
+// which is root, so it signals them directly.
+
+static RUNNING_PID: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+struct RunningGuard;
+
+impl RunningGuard {
+    fn set(pid: u32) -> Self {
+        if let Ok(mut slot) = RUNNING_PID.lock() {
+            *slot = Some(pid);
+        }
+        RunningGuard
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = RUNNING_PID.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// Stop the running cancellable command, if any. Returns once the kill has
+/// been sent; the command's own runner then returns an error to its caller.
+pub fn kill_running() {
+    let pid = RUNNING_PID.lock().ok().and_then(|slot| *slot);
+    if let Some(pid) = pid {
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+}
+
+/// Like `run_privileged`, but records the PID so `kill_running` can stop it.
+/// For long operations only — never for partitioning or mkfs, which must not
+/// be interrupted halfway.
+pub fn run_privileged_cancellable(cmd: &str, args: &[&str]) -> Result<String> {
+    let child = privileged_command(cmd, args)?
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let _running = RunningGuard::set(child.id());
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(BootOsProError::CommandFailed {
+            cmd: cmd.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into())
+}
+
+/// True inside the privileged helper (started once per operation via pkexec).
+pub fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Build a privileged command. Privileged commands run only inside the
+/// helper, which is already root; the app sends jobs and never runs one.
+fn privileged_command(cmd: &str, args: &[&str]) -> Result<Command> {
+    if !is_root() {
+        return Err(BootOsProError::Other(format!(
+            "internal: {cmd} must run inside bootospro-helper"
+        )));
+    }
+    let mut c = Command::new(cmd);
+    c.args(args);
+    Ok(c)
+}
+
 pub fn run_privileged(cmd: &str, args: &[&str]) -> Result<String> {
-    let mut full_args = vec![HELPER, cmd];
-    full_args.extend_from_slice(args);
-    let output = Command::new("pkexec").args(&full_args).output()?;
+    let output = privileged_command(cmd, args)?.output()?;
     if !output.status.success() {
         return Err(BootOsProError::CommandFailed {
             cmd: cmd.to_string(),

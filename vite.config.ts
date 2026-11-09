@@ -1,3 +1,5 @@
+// Boot OS Pro — vite.config.ts — build 1.0.2 — Monday 9 November 2026
+
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 

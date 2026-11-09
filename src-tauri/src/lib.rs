@@ -1,7 +1,11 @@
+// Boot OS Pro — lib.rs — build 1.0.2 — Monday 9 November 2026
+
 mod commands;
-mod disk;
-mod error;
+pub mod disk;
+pub mod error;
 mod grub;
+pub mod jobs;
+mod helper_client;
 mod manifest;
 mod squash;
 mod theme;
@@ -22,6 +26,7 @@ pub fn run() {
             commands::run_full_write,
             commands::add_persistent_iso,
             commands::add_live_iso,
+            commands::fill_slot,
             commands::format_persistent_slot,
             commands::format_free_space_slot,
             commands::read_drive_manifest,
@@ -33,8 +38,9 @@ pub fn run() {
             commands::wipe_device,
             commands::unmount_partition,
             commands::get_file_size,
-            commands::get_iso_arch,
+            commands::get_iso_info,
             commands::get_theme_colors,
+            commands::installed_version,
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]

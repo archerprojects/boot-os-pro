@@ -1,3 +1,4 @@
+// Boot OS Pro — tsconfig.json — build 1.0.2 — Monday 9 November 2026
 {
   "compilerOptions": {
     "target": "ES2021",

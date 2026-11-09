@@ -1,3 +1,5 @@
+// Boot OS Pro — grub.rs — build 1.0.2 — Monday 9 November 2026
+
 use crate::error::{BootOsProError, Result};
 use crate::disk::run_privileged;
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,8 @@ pub struct PersistentEntry {
     pub boot_params: String,
 }
 
-/// An ISO entry for the free space live session slot — loopback boot from FAT32.
+/// An ISO entry for the free space live session slot — loopback boot from the
+/// free space partition (exFAT on new drives, FAT32 on drives made earlier).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveEntry {
     pub name: String,
@@ -27,6 +30,12 @@ pub struct LiveEntry {
     pub initrd: String,
     pub boot_params: String,
     pub locate: String,
+    /// Filesystem UUID of the live (free space) partition, for families that
+    /// locate the ISO file by device (Arch img_dev). Empty if unknown.
+    pub free_uuid: String,
+    /// Extra initrd in the free space partition's `bootospro/` folder that lets
+    /// a casper ISO find itself on exFAT. Empty when not needed.
+    pub overlay: String,
 }
 
 pub fn install_grub(efi_mnt: &str, dev: &str) -> Result<()> {
@@ -65,7 +74,7 @@ pub fn write_grub_config(
 insmod fat
 insmod part_gpt
 
-if loadfont /{grub_dir}/fonts/unicode.pf2; then
+if loadfont /boot/{grub_dir}/fonts/unicode.pf2; then
   set gfxmode=auto
   if [ ${{grub_platform}} == "efi" ]; then
     insmod efi_gop
@@ -88,14 +97,19 @@ source /boot/{grub_dir}/bootospro.cfg
 
     let main_cfg = build_main_cfg(persistent, live);
 
-    let pid = std::process::id();
-    let tmp_efi  = format!("/tmp/bootospro-efi-{pid}.cfg");
-    let tmp_main = format!("/tmp/bootospro-main-{pid}.cfg");
+    // Stage in a fresh private directory (mktemp -d, mode 700) — never at a
+    // predictable /tmp name, since this runs as root inside the helper.
+    let stage = crate::disk::make_temp_dir()?;
+    let tmp_efi  = format!("{stage}/grub.cfg");
+    let tmp_main = format!("{stage}/bootospro.cfg");
 
-    std::fs::write(&tmp_efi, &efi_cfg)
-        .map_err(|e| BootOsProError::Other(format!("write tmp efi cfg: {e}")))?;
-    std::fs::write(&tmp_main, &main_cfg)
-        .map_err(|e| BootOsProError::Other(format!("write tmp main cfg: {e}")))?;
+    let staged = std::fs::write(&tmp_efi, &efi_cfg)
+        .and_then(|_| std::fs::write(&tmp_main, &main_cfg))
+        .map_err(|e| BootOsProError::Other(format!("stage grub config: {e}")));
+    if let Err(e) = staged {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(e);
+    }
 
     let grub_cfg_dir = format!("{efi_mnt}/boot/{grub_dir}");
     let efi_dest  = format!("{grub_cfg_dir}/grub.cfg");
@@ -104,36 +118,21 @@ source /boot/{grub_dir}/bootospro.cfg
     let result = run_privileged("cp", &[&tmp_efi, &efi_dest])
         .and_then(|_| run_privileged("cp", &[&tmp_main, &main_dest]));
 
-    let _ = std::fs::remove_file(&tmp_efi);
-    let _ = std::fs::remove_file(&tmp_main);
+    let _ = std::fs::remove_dir_all(&stage);
 
     result?;
     Ok(())
 }
 
+/// Rewrite the menu on an existing drive. Writes grub.cfg as well as
+/// bootospro.cfg, so drives made by older builds also pick up fixes to the
+/// top-level config (e.g. the font path corrected in 1.0.18).
 pub fn update_grub_config(
     efi_mnt: &str,
     persistent: &[PersistentEntry],
     live: &[LiveEntry],
 ) -> Result<()> {
-    let grub_dir = if std::path::Path::new(&format!("{efi_mnt}/boot/grub2")).exists() {
-        "grub2"
-    } else {
-        "grub"
-    };
-
-    let main_cfg = build_main_cfg(persistent, live);
-
-    let pid = std::process::id();
-    let tmp = format!("/tmp/bootospro-main-{pid}.cfg");
-    std::fs::write(&tmp, &main_cfg)
-        .map_err(|e| BootOsProError::Other(format!("write tmp cfg: {e}")))?;
-
-    let main_dest = format!("{efi_mnt}/boot/{grub_dir}/bootospro.cfg");
-    let result = run_privileged("cp", &[&tmp, &main_dest]);
-    let _ = std::fs::remove_file(&tmp);
-    result?;
-    Ok(())
+    write_grub_config(efi_mnt, persistent, live)
 }
 
 /// Build the menu body: every persistent OS first, then every live ISO.
@@ -229,21 +228,34 @@ fn strip_live_params(params: &str) -> String {
 
 fn build_live_entry(entry: &LiveEntry) -> String {
     let filename = &entry.filename;
-    let initrds: String = entry.initrd
+    let mut initrds: String = entry.initrd
         .split_whitespace()
         .map(|i| format!(" (iso){i}"))
         .collect();
+    // Loaded after the ISO's own initrd, so its files replace the originals.
+    if !entry.overlay.is_empty() {
+        initrds.push_str(&format!(" /bootospro/{}", entry.overlay));
+    }
 
     // The live ISO's initrd must be told where to find the ISO file on the
-    // FAT32 partition so it can loop-mount the squashfs. The method differs by
+    // free space partition so it can loop-mount the squashfs. The method differs by
     // family (detected at write time, carried in `locate`):
     //   iso-scan → iso-scan/filename=/file.iso   (casper: Ubuntu/Mint)
     //   findiso  → findiso=/file.iso             (live-boot: Debian/Sparky)
+    //   archiso  → img_dev=<live partition> img_loop=/file.iso (Arch/Manjaro;
+    //              archisolabel= alone looks for a whole device, not a file)
     //   none     → family self-locates via a label param already in boot_params
-    //              (Fedora root=live:CDLABEL=, Arch archisolabel=)
     let locate = match entry.locate.as_str() {
         "iso-scan" => format!(" iso-scan/filename=/{filename}"),
         "findiso"  => format!(" findiso=/{filename}"),
+        "archiso"  => {
+            let dev = if entry.free_uuid.is_empty() {
+                "/dev/disk/by-label/FREESPACE".to_string()
+            } else {
+                format!("/dev/disk/by-uuid/{}", entry.free_uuid)
+            };
+            format!(" img_dev={dev} img_loop=/{filename}")
+        }
         _ => String::new(),
     };
 
@@ -252,6 +264,7 @@ fn build_live_entry(entry: &LiveEntry) -> String {
          \tinsmod loopback\n\
          \tinsmod iso9660\n\
          \tinsmod fat\n\
+         \tinsmod exfat\n\
          \tsearch --label --no-floppy --set=root FREESPACE\n\
          \tset isofile=\"/{filename}\"\n\
          \tloopback iso $isofile\n\

@@ -1,5 +1,8 @@
+// Boot OS Pro — DiskManager.tsx — build 1.0.2 — Monday 9 November 2026
+
 import { useState, useEffect } from 'react';
 import type { BlockDevice, Partition } from '../lib/types';
+import { GIB } from '../lib/units';
 import {
   listDevices, getPartitionLayout, formatPartition,
   deletePartition, wipeDevice, onWriteProgress,
@@ -87,6 +90,14 @@ export function DiskManager() {
       setError(String(e));
       setOpState('error');
     }
+
+    // Re-read the drive after every operation, success or failure, so the
+    // layout always matches the stick (the desktop may also have remounted).
+    setActivePart(null);
+    setAction(null);
+    if (selected) {
+      try { setLayout(await getPartitionLayout(selected.path)); } catch { /* keep last layout */ }
+    }
   };
 
   const handleFormat = () => {
@@ -156,12 +167,20 @@ export function DiskManager() {
     );
   };
 
+  // Empty Slot and Clear Live rewrite the Boot OS Pro boot menu, so they are
+  // offered only on a Boot OS Pro drive (ESP + BOOTOSPRO partitions present).
+  // On any other drive an ext4 partition is just a partition.
+  const isBootOsProDrive =
+    !!layout &&
+    layout.children.some(p => p.label.toUpperCase() === 'ESP') &&
+    layout.children.some(p => p.label.toUpperCase() === 'BOOTOSPRO');
+
   // Classify the selected partition so the right action is offered.
   const activeIsPersistent =
-    !!activePart && activePart.fstype === 'ext4' &&
+    isBootOsProDrive && !!activePart && activePart.fstype === 'ext4' &&
     activePart.label.toUpperCase() !== 'BOOTOSPRO';
   const activeIsFreeSpace =
-    !!activePart && activePart.label.toUpperCase() === 'FREESPACE';
+    isBootOsProDrive && !!activePart && activePart.label.toUpperCase() === 'FREESPACE';
 
   const totalBytes = layout?.size_bytes ?? 1;
   const usedBytes  = layout?.children.reduce((s, p) => s + p.size_bytes, 0) ?? 0;
@@ -247,9 +266,9 @@ export function DiskManager() {
                     outline: activePart?.path === p.path ? '2px solid var(--accent)' : 'none',
                   }}
                   onClick={() => { setActivePart(p); setAction(null); setError(null); }}
-                  title={`${p.path} — ${p.fstype || 'unknown'} — ${(p.size_bytes / 1e9).toFixed(1)} GB`}
+                  title={`${p.path} — ${p.fstype || 'unknown'} — ${(p.size_bytes / GIB).toFixed(1)} GiB`}
                 >
-                  <span style={{ fontSize: '0.65rem' }}>{(p.size_bytes / 1e9).toFixed(1)}G</span>
+                  <span style={{ fontSize: '0.65rem' }}>{(p.size_bytes / GIB).toFixed(1)}G</span>
                 </div>
               ))}
               {freeBytes > 1e8 && (
@@ -271,7 +290,7 @@ export function DiskManager() {
                   <div className="dm-part-info">
                     <span className="dm-part-path">{p.path}</span>
                     <span className="dm-part-meta">
-                      {p.fstype || 'unformatted'} · {(p.size_bytes / 1e9).toFixed(1)} GB
+                      {p.fstype || 'unformatted'} · {(p.size_bytes / GIB).toFixed(1)} GiB
                       {p.label && ` · ${p.label}`}
                       {p.mountpoint && ` · 📌 ${p.mountpoint}`}
                     </span>
@@ -308,8 +327,7 @@ export function DiskManager() {
                         Format
                       </button>
                       <button className="btn btn-danger" style={{ padding: '4px 10px', fontSize: '12px' }}
-                        disabled={busy || !!p.mountpoint}
-                        title={p.mountpoint ? 'Unmount first' : ''}
+                        disabled={busy}
                         onClick={ev => { ev.stopPropagation(); setAction('delete'); }}>
                         Delete
                       </button>
@@ -324,13 +342,13 @@ export function DiskManager() {
             <div className="card">
               <div className="section-label">Format {activePart.path}</div>
               <div className="warn-box" style={{ marginBottom: '0.5rem' }}>
-                Warning: Persistent Drives on this disc require Ext4 format. Free
-                Space drives require Fat32 format. Please select accordingly when
-                re-formatting.
+                Warning: Persistent partitions on this disk require ext4. The free
+                space partition requires exFAT (FAT32 on drives made by older
+                versions). Please select accordingly when re-formatting.
               </div>
               {activePart.mountpoint && (
                 <div className="warn-box" style={{ marginBottom: '0.5rem' }}>
-                  Partition mounted at {activePart.mountpoint} — unmount before formatting.
+                  Partition mounted at {activePart.mountpoint} — it will be unmounted before formatting.
                 </div>
               )}
               <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -349,7 +367,7 @@ export function DiskManager() {
               <div style={{ display: 'flex', gap: '8px', marginTop: '0.5rem', justifyContent: 'flex-end' }}>
                 <button className="btn" onClick={() => setAction(null)}>Cancel</button>
                 <button className="btn btn-danger"
-                  disabled={busy || !!activePart.mountpoint}
+                  disabled={busy}
                   onClick={handleFormat}>
                   Format
                 </button>
@@ -360,7 +378,10 @@ export function DiskManager() {
           {action === 'delete' && activePart && (
             <div className="card">
               <div className="section-label">Delete {activePart.path}</div>
-              <div className="warn-box">Permanently deletes the partition and all its data.</div>
+              <div className="warn-box">
+                Permanently deletes the partition and all its data.
+                {activePart.mountpoint && ' Partitions on this drive will be unmounted first.'}
+              </div>
               <div style={{ display: 'flex', gap: '8px', marginTop: '0.5rem', justifyContent: 'flex-end' }}>
                 <button className="btn" onClick={() => setAction(null)}>Cancel</button>
                 <button className="btn btn-danger" disabled={busy} onClick={handleDelete}>
@@ -409,7 +430,7 @@ export function DiskManager() {
             <div className="section-label">Wipe entire device</div>
             <p style={{ color: 'var(--text-secondary)', fontSize: '13px', margin: '0 0 0.5rem' }}>
               Erases everything and creates a single partition. fat32 works on
-              Linux, Windows, and macOS; choose exfat for files over 4 GB.
+              Linux, Windows, and macOS; choose exfat for files over 4 GiB.
             </p>
             <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
               <input className="text-input" placeholder="Label"

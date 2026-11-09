@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # build.sh — Builds Boot OS Pro and packages it as a .deb
+# build 1.0.2 — Monday 9 November 2026
 # Always install from dist/ — the Tauri bundler deb lacks the polkit policy and helper.
 set -euo pipefail
 
@@ -56,6 +57,13 @@ TAURI_BINARY="$SCRIPT_DIR/src-tauri/target/release/$APP_NAME"
 [[ -f "$TAURI_BINARY" ]] || error "Build failed — binary not found at $TAURI_BINARY"
 success "Binary built: $(du -sh "$TAURI_BINARY" | cut -f1)"
 
+# The privileged helper is the second binary in the crate. Build it explicitly
+# so packaging never depends on which binaries the Tauri CLI chooses to build.
+info "Building privileged helper…"
+cargo build --release --bin bootospro-helper --manifest-path "$SCRIPT_DIR/src-tauri/Cargo.toml"
+HELPER_BINARY="$SCRIPT_DIR/src-tauri/target/release/bootospro-helper"
+[[ -f "$HELPER_BINARY" ]] || error "Build failed — helper not found at $HELPER_BINARY"
+
 # Always assemble from skeleton — never use Tauri's .deb directly.
 info "Assembling .deb from skeleton…"
 
@@ -65,6 +73,7 @@ trap "rm -rf $BUILD_DIR" EXIT
 cp -r "$SCRIPT_DIR/deb-skeleton/." "$BUILD_DIR/"
 
 install -Dm755 "$TAURI_BINARY" "$BUILD_DIR/usr/bin/$APP_NAME"
+install -Dm755 "$HELPER_BINARY" "$BUILD_DIR/usr/lib/bootospro/bootospro-helper"
 
 ICON_SRC="$SCRIPT_DIR/src-tauri/icons/128x128.png"
 if [[ -f "$ICON_SRC" ]]; then

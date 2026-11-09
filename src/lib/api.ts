@@ -1,3 +1,5 @@
+// Boot OS Pro — api.ts — build 1.0.2 — Monday 9 November 2026
+
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
@@ -5,6 +7,7 @@ import type {
   IsoWriteSpec,
   WriteProgressEvent,
   DriveReport,
+  IsoInfo,
 } from './types';
 
 // ── Device ──────────────────────────────────────────────────────────────────
@@ -22,6 +25,7 @@ export async function runFullWrite(
   free_space_gb: number,
 ): Promise<void> {
   const persistent = isos.filter(i => i.iso_type === 'persistent');
+  const reserved = isos.filter(i => i.iso_type === 'reserved');
   const liveIsos = isos.filter(i => i.iso_type === 'live');
   return invoke('run_full_write', {
     args: {
@@ -36,6 +40,7 @@ export async function runFullWrite(
         username: i.username,
         password: i.password,
       })),
+      reserved: reserved.map(r => ({ label: r.label, size_gb: r.size_gb })),
       free_space_gb,
       // Live boot params are detected from the ISO structure at write time —
       // the backend does not accept them here.
@@ -56,6 +61,30 @@ export async function addPersistentIso(
   return invoke('add_persistent_iso', {
     args: {
       device,
+      iso: {
+        name: iso.name,
+        path: iso.path,
+        label: iso.label,
+        size_gb: iso.size_gb,
+        boot_params: iso.boot_params,
+        username: iso.username,
+        password: iso.password,
+      },
+    },
+  });
+}
+
+// ── Install into an empty slot on an existing drive (no carve) ─────────────
+
+export async function fillSlot(
+  device: string,
+  slotLabel: string,
+  iso: IsoWriteSpec,
+): Promise<void> {
+  return invoke('fill_slot', {
+    args: {
+      device,
+      slot_label: slotLabel,
       iso: {
         name: iso.name,
         path: iso.path,
@@ -155,12 +184,17 @@ export async function unmountPartition(partition: string): Promise<void> {
 
 // ── File utilities ───────────────────────────────────────────────────────────
 
+/** Installed package version ("" if unknown). */
+export async function installedVersion(): Promise<string> {
+  return invoke<string>('installed_version');
+}
+
 export async function getFileSize(path: string): Promise<number> {
   return invoke<number>('get_file_size', { path });
 }
 
-// ── ISO architecture detection ────────────────────────────────────────────────
+// ── ISO probe (architecture, unpacked size) ─────────────────────────────────
 
-export async function getIsoArch(path: string): Promise<string> {
-  return invoke<string>('get_iso_arch', { path });
+export async function getIsoInfo(path: string): Promise<IsoInfo> {
+  return invoke<IsoInfo>('get_iso_info', { path });
 }

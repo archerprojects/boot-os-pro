@@ -1,3 +1,5 @@
+/* Boot OS Pro — app.css — build 1.0.2 — Monday 9 November 2026 */
+
 /* ── Reset & base ─────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -248,6 +250,7 @@ body {
 }
 .field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
 .field-hint { font-size: 11px; color: var(--text-secondary); font-weight: 400; }
+.field-error { font-size: 11px; color: var(--error); font-weight: 500; }
 
 .text-input {
   width: 100%; padding: 7px 10px; border-radius: var(--radius-sm);

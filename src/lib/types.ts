@@ -1,3 +1,5 @@
+// Boot OS Pro — types.ts — build 1.0.2 — Monday 9 November 2026
+
 export interface BlockDevice {
   path: string;
   model: string;
@@ -24,7 +26,12 @@ export interface IsoWriteSpec {
   size_gb: number;
   boot_params: string;
   file_size_bytes: number;
-  iso_type: 'persistent' | 'live';
+  /** Unpacked root filesystem size from the ISO probe; 0 if unknown. */
+  unpacked_bytes: number;
+  /** 'reserved' is an empty ext4 slot on a new drive, kept for a later OS. */
+  iso_type: 'persistent' | 'live' | 'reserved';
+  /** Existing drive only: label of the empty slot to install into ('' = carve). */
+  target_slot: string;
   username: string;
   password: string;
 }
@@ -68,6 +75,7 @@ export interface LiveRecord {
   boot_params: string;
   locate: string;
   size_bytes: number;
+  overlay?: string;
 }
 
 export interface FreeSpaceRecord {
@@ -98,6 +106,12 @@ export interface Manifest {
   free_space: FreeSpaceRecord;
   installer: InstallerRecord;
   body_hash: string;
+}
+
+export interface IsoInfo {
+  arch: string;
+  unpacked_bytes: number;
+  unpacked_exact: boolean;
 }
 
 export interface DriveReport {

@@ -1,7 +1,10 @@
+# Boot OS Pro — Cargo.toml — build 1.0.2 — Monday 9 November 2026
 [package]
 name = "bootospro"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2021"
+# Two binaries: the app, and the privileged helper (src/bin/bootospro-helper.rs).
+default-run = "bootospro"
 
 [lib]
 name = "bootospro_lib"

@@ -1,8 +1,14 @@
+// Boot OS Pro — ImagesStep.tsx — build 1.0.2 — Monday 9 November 2026
+
 import { useEffect, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { homeDir } from '@tauri-apps/api/path';
-import { listDevices, getFileSize, getPartitionLayout, getIsoArch } from '../lib/api';
+import { listDevices, getFileSize, getPartitionLayout, getIsoInfo } from '../lib/api';
 import type { IsoWriteSpec, BlockDevice, Partition, DriveReport } from '../lib/types';
+import {
+  GIB, MIB, FIXED_OVERHEAD_GIB, CARVE_HEADROOM_GIB, FAT32_MAX_FILE,
+  UNPACK_RATIO_ESTIMATE, MIN_SLOT_GIB,
+} from '../lib/units';
 
 interface Props {
   device: BlockDevice | null;
@@ -46,16 +52,34 @@ function makeLabel(name: string, existing: IsoWriteSpec[]): string {
 }
 
 function formatBytes(bytes: number): string {
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  return `${(bytes / 1e6).toFixed(0)} MB`;
+  if (bytes >= GIB) return `${(bytes / GIB).toFixed(1)} GiB`;
+  return `${(bytes / MIB).toFixed(0)} MiB`;
 }
 
 function formatGb(gb: number): string {
-  return `${gb % 1 === 0 ? gb : gb.toFixed(1)} GB`;
+  return `${gb % 1 === 0 ? gb : gb.toFixed(1)} GiB`;
 }
 
-const EXTRACTED_MULTIPLIER = 2.2;
-const HEADROOM = 1.1;
+// Same rule as the backend (jobs.rs valid_username): accepted by useradd on
+// every supported family.
+const USERNAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+
+// Persistent sizing: the default is twice the real unpacked size (room to
+// install and update); the minimum is the unpacked size plus 10 %.
+function unpackedGib(e: IsoWriteSpec): number {
+  return e.unpacked_bytes > 0
+    ? e.unpacked_bytes / GIB
+    : (e.file_size_bytes * UNPACK_RATIO_ESTIMATE) / GIB;
+}
+function defaultSizeGib(e: IsoWriteSpec): number {
+  return Math.max(1, Math.ceil(unpackedGib(e) * 2));
+}
+function minSizeGib(e: IsoWriteSpec): number {
+  return e.iso_type === 'reserved' ? MIN_SLOT_GIB : Math.max(1, Math.ceil(unpackedGib(e) * 1.1));
+}
+
+/** An empty reserved slot on an existing drive. */
+interface EmptySlot { label: string; sizeGb: number; }
 
 // Classify partitions from real drive layout
 interface DriveLayout {
@@ -64,19 +88,22 @@ interface DriveLayout {
   existingPersistentGb: number;
   existingPartitions: Partition[];
   totalGb: number;
+  /** Filesystem of the FREESPACE partition ('vfat', 'exfat', or '' if none). */
+  freeFstype: string;
 }
 
 function parseDriveLayout(device: BlockDevice): DriveLayout {
-  const totalGb = device.size_bytes / 1e9;
+  const totalGb = device.size_bytes / GIB;
   let efiGb = 0;
   let biosBootGb = 0;
   let existingPersistentGb = 0;
+  let freeFstype = '';
   const existingPartitions: Partition[] = [];
 
   for (const p of device.children) {
     const labelUp = p.label.toUpperCase();
     const fsUp = p.fstype.toUpperCase();
-    const gb = p.size_bytes / 1e9;
+    const gb = p.size_bytes / GIB;
 
     // BIOS Boot — tiny unformatted, type GUID 21686148
     if (p.part_type.startsWith('21686148') || labelUp === 'BIOS BOOT' || labelUp === 'BIOS_BOOT') {
@@ -88,6 +115,7 @@ function parseDriveLayout(device: BlockDevice): DriveLayout {
     }
     // Free space partition
     else if (labelUp === 'FREESPACE' || labelUp === 'FREE SPACE') {
+      freeFstype = p.fstype.toLowerCase();
       existingPartitions.push(p);
     }
     // Persistent ext4 partition
@@ -104,10 +132,10 @@ function parseDriveLayout(device: BlockDevice): DriveLayout {
     }
   }
 
-  // If no EFI found but drive has partitions, use 0.5 GB as fallback
+  // If no EFI found but drive has partitions, use 0.5 GiB as fallback
   if (efiGb === 0 && device.children.length > 0) efiGb = 0.5;
 
-  return { efiGb, biosBootGb, existingPersistentGb, existingPartitions, totalGb };
+  return { efiGb, biosBootGb, existingPersistentGb, existingPartitions, totalGb, freeFstype };
 }
 
 // ── Configure ISO page ─────────────────────────────────────────────────────
@@ -120,18 +148,27 @@ interface ConfigureProps {
   driveGb: number;
   existingPersistentGb: number;
   maxPersistentOverrideGb?: number;
+  /** Existing drive: empty slots not already taken by another queued ISO. */
+  emptySlots: EmptySlot[];
+  /** Existing drive whose free space partition is FAT32 (4 GiB file limit). */
+  freeIsFat32: boolean;
   onSave: (entry: IsoWriteSpec) => void;
   onCancel: () => void;
 }
 
 function ConfigureIso({
   entry, isNew, isos, editIdx, driveGb,
-  existingPersistentGb, maxPersistentOverrideGb, onSave, onCancel,
+  existingPersistentGb, maxPersistentOverrideGb, emptySlots, freeIsFat32, onSave, onCancel,
 }: ConfigureProps) {
   const [e, setE] = useState<IsoWriteSpec>({ ...entry });
-  const [typeChosen, setTypeChosen] = useState(!isNew);
+  const [typeChosen, setTypeChosen] = useState(!isNew || entry.iso_type === 'reserved');
+  const [sizeText, setSizeText] = useState(String(entry.size_gb));
 
+  const isReserved   = e.iso_type === 'reserved';
   const isPersistent = e.iso_type === 'persistent';
+  const isLive       = e.iso_type === 'live';
+  const usesPartition = isPersistent || isReserved;
+  const slot = isPersistent ? emptySlots.find(sl => sl.label === e.target_slot) : undefined;
 
   // Live ISOs all share the free space partition. We track how many are already
   // queued and the total live bytes so we can show free-space awareness, but we
@@ -141,134 +178,194 @@ function ConfigureIso({
     .filter((i, idx) => i.iso_type === 'live' && idx !== editIdx)
     .reduce((s, i) => s + i.file_size_bytes, 0);
 
-  const efiGb = 0.5;
-  const sessionPersistentGb = isos
+  // Space already taken by other queued partitions (slot installs take none).
+  const sessionPartitionGb = isos
     .filter((_, idx) => idx !== editIdx)
-    .filter(i => i.iso_type === 'persistent')
+    .filter(i => i.iso_type !== 'live' && !i.target_slot)
     .reduce((s, i) => s + i.size_gb, 0);
 
-  const totalAllocated = efiGb + existingPersistentGb + sessionPersistentGb;
+  const totalAllocated = FIXED_OVERHEAD_GIB + existingPersistentGb + sessionPartitionGb;
   // On an existing drive, a new persistent partition is carved from the real
   // FREESPACE partition, so the ceiling is that free space minus what this
   // session already queued — not the whole-drive arithmetic.
   const availableGb = maxPersistentOverrideGb !== undefined
-    ? Math.max(0, maxPersistentOverrideGb)
+    ? Math.max(0, maxPersistentOverrideGb - sessionPartitionGb - CARVE_HEADROOM_GIB)
     : Math.max(0, driveGb - totalAllocated);
+  const fitsGb = Math.floor(availableGb);
 
-  const extractedGb = (e.file_size_bytes / 1e9) * EXTRACTED_MULTIPLIER * HEADROOM;
-  const minSizeGb = Math.max(1, Math.ceil(extractedGb) + 1);
-  const maxSizeGb = Math.max(minSizeGb + 1, Math.floor(availableGb));
-  const clampedSize = Math.min(Math.max(e.size_gb, minSizeGb), maxSizeGb);
-  const remainingAfter = Math.max(0, availableGb - clampedSize);
+  const minGb = minSizeGib(e);
+  const sizeGb = Number(sizeText);
+
+  // Why the size cannot be used — shown beside the field and on Add.
+  let sizeError: string | null = null;
+  if (usesPartition && slot) {
+    if (slot.sizeGb < minGb) {
+      sizeError = `${slot.label} is ${formatGb(slot.sizeGb)}; this OS needs at least ${minGb} GiB.`;
+    }
+  } else if (usesPartition) {
+    if (!/^\d+$/.test(sizeText)) sizeError = 'Enter a whole number of GiB.';
+    else if (sizeGb < minGb)     sizeError = `At least ${minGb} GiB is needed.`;
+    else if (sizeGb > fitsGb)    sizeError = `Only ${fitsGb} GiB is free.`;
+  }
+  const tooBigForFat32 = isLive && freeIsFat32 && e.file_size_bytes > FAT32_MAX_FILE;
 
   const chooseType = (t: 'persistent' | 'live') => {
     setE({ ...e, iso_type: t });
     setTypeChosen(true);
   };
 
+  const save = () => onSave({
+    ...e,
+    size_gb: slot ? slot.sizeGb : usesPartition ? sizeGb : e.size_gb,
+  });
+
   return (
     <div className="step-layout">
       <div className="step-header">
-        <h1>{isNew ? 'Add ISO' : 'Edit ISO'}</h1>
+        <h1>{isReserved ? (isNew ? 'Reserve empty slot' : 'Edit empty slot') : (isNew ? 'Add ISO' : 'Edit ISO')}</h1>
+        {isReserved && (
+          <p>An empty ext4 partition kept for a persistent OS you add later.
+            Nothing is installed in it now.</p>
+        )}
       </div>
 
       <div className="card form-card">
-        <label className="field">
-          <span>Display name</span>
-          <input
-            value={e.name}
-            onChange={ev => setE({ ...e, name: ev.target.value })}
-            placeholder="e.g. Linux Mint 22"
-          />
-        </label>
-
-        <div className="field">
-          <span>Type</span>
-          <div className="field-hint" style={{ marginBottom: '0.4rem' }}>
-            Select the Drive Type below to Continue
-          </div>
-          <div className="type-grid">
-            <button
-              type="button"
-              className={`type-card ${typeChosen && !isPersistent ? 'type-active' : ''} ${!typeChosen ? 'type-unset' : ''}`}
-              onClick={() => chooseType('live')}
-            >
-              <div className="type-radio">
-                <div className={`radio-dot ${typeChosen && !isPersistent ? 'on' : ''}`} />
-              </div>
-              <div className="type-body">
-                <div className="type-title">Live Session</div>
-                <div className="type-sub">Free Space Partition</div>
-                <div className="type-sub">No Persistence</div>
-              </div>
-            </button>
-
-            <button
-              type="button"
-              className={`type-card ${typeChosen && isPersistent ? 'type-active' : ''} ${!typeChosen ? 'type-unset' : ''}`}
-              onClick={() => chooseType('persistent')}
-            >
-              <div className="type-radio">
-                <div className={`radio-dot ${typeChosen && isPersistent ? 'on' : ''}`} />
-              </div>
-              <div className="type-body">
-                <div className="type-title">Persistent OS</div>
-                <div className="type-sub">EXT4 Partition</div>
-                <div className="type-sub">Apps and Data Survive Reboot</div>
-              </div>
-            </button>
-          </div>
-          {typeChosen && !isPersistent && (
-            <div className="info-panel">
-              Live ISOs share the free space partition — you can add several and
-              pick which to boot from the GRUB menu. They run without persistence
-              (changes are lost on reboot).
-              {sessionLiveCount > 0 &&
-                ` ${sessionLiveCount} live ISO${sessionLiveCount > 1 ? 's' : ''} already queued (${formatBytes(sessionLiveBytes)}).`}
-            </div>
-          )}
-        </div>
-
-        {typeChosen && isPersistent && (
-          <div className="field">
-            <span>Partition size: <strong>{formatGb(clampedSize)}</strong></span>
+        {!isReserved && (
+          <label className="field">
+            <span>Display name</span>
             <input
-              type="range"
-              min={minSizeGb}
-              max={maxSizeGb}
-              value={clampedSize}
-              onChange={ev => setE({ ...e, size_gb: Number(ev.target.value) })}
+              value={e.name}
+              onChange={ev => setE({ ...e, name: ev.target.value })}
+              placeholder="e.g. Linux Mint 22"
             />
-            <div className="field-hint">
-              Minimum {minSizeGb} GB (extracted OS + headroom).
-              {availableGb > 0 && ` ${formatGb(availableGb)} available on this drive.`}
-              {remainingAfter > 0.5 && ` ${formatGb(remainingAfter)} will remain as free space.`}
+          </label>
+        )}
+
+        {!isReserved && (
+          <div className="field">
+            <span>Type</span>
+            <div className="field-hint" style={{ marginBottom: '0.4rem' }}>
+              Select the Drive Type below to Continue
             </div>
+            <div className="type-grid">
+              <button
+                type="button"
+                className={`type-card ${typeChosen && isLive ? 'type-active' : ''} ${!typeChosen ? 'type-unset' : ''}`}
+                onClick={() => chooseType('live')}
+              >
+                <div className="type-radio">
+                  <div className={`radio-dot ${typeChosen && isLive ? 'on' : ''}`} />
+                </div>
+                <div className="type-body">
+                  <div className="type-title">Live Session</div>
+                  <div className="type-sub">Free Space Partition</div>
+                  <div className="type-sub">No Persistence</div>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                className={`type-card ${typeChosen && isPersistent ? 'type-active' : ''} ${!typeChosen ? 'type-unset' : ''}`}
+                onClick={() => chooseType('persistent')}
+              >
+                <div className="type-radio">
+                  <div className={`radio-dot ${typeChosen && isPersistent ? 'on' : ''}`} />
+                </div>
+                <div className="type-body">
+                  <div className="type-title">Persistent OS</div>
+                  <div className="type-sub">EXT4 Partition</div>
+                  <div className="type-sub">Apps and Data Survive Reboot</div>
+                </div>
+              </button>
+            </div>
+            {typeChosen && isLive && (
+              <div className="info-panel">
+                Live ISOs share the free space partition — you can add several and
+                pick which to boot from the GRUB menu. They run without persistence
+                (changes are lost on reboot).
+                {sessionLiveCount > 0 &&
+                  ` ${sessionLiveCount} live ISO${sessionLiveCount > 1 ? 's' : ''} already queued (${formatBytes(sessionLiveBytes)}).`}
+              </div>
+            )}
+            {typeChosen && tooBigForFat32 && (
+              <div className="warn-box" style={{ marginTop: '0.5rem' }}>
+                This ISO is {formatBytes(e.file_size_bytes)}. The free space partition on
+                this drive is FAT32, which cannot hold a file of 4 GiB or more. Use Clear
+                Live in Disk Manager to re-format it as exFAT, then add the ISO again.
+              </div>
+            )}
           </div>
         )}
 
-        <div className="field">
-          <span>ISO file</span>
-          <input value={e.path} readOnly className="input-readonly" />
-          {e.file_size_bytes > 0 && (
+        {typeChosen && isPersistent && emptySlots.length > 0 && (
+          <div className="field">
+            <span>Install into</span>
+            <select
+              className="text-input"
+              value={e.target_slot}
+              onChange={ev => setE({ ...e, target_slot: ev.target.value })}
+            >
+              <option value="">New partition from free space</option>
+              {emptySlots.map(sl => (
+                <option key={sl.label} value={sl.label}>
+                  Empty slot {sl.label} ({formatGb(sl.sizeGb)})
+                </option>
+              ))}
+            </select>
+            {slot && (
+              <div className="field-hint">
+                The OS is installed into {slot.label}. Free space and the live ISOs on
+                it are kept.
+              </div>
+            )}
+          </div>
+        )}
+
+        {typeChosen && usesPartition && !slot && (
+          <label className="field">
+            <span>Partition size (GiB)</span>
+            <input
+              inputMode="numeric"
+              value={sizeText}
+              onChange={ev => setSizeText(ev.target.value.replace(/[^0-9]/g, ''))}
+              style={{ width: '8rem' }}
+            />
             <div className="field-hint">
-              {formatBytes(e.file_size_bytes)}
-              {typeChosen && isPersistent && ` · Estimated extracted: ~${(e.file_size_bytes / 1e9 * EXTRACTED_MULTIPLIER).toFixed(1)} GB`}
+              Free: {fitsGb} GiB. Minimum: {minGb} GiB
+              {isPersistent && (e.unpacked_bytes > 0
+                ? ` (this OS unpacks to ${formatBytes(e.unpacked_bytes)})`
+                : ' (estimated from the ISO size)')}.
+              {isPersistent && ` Suggested: ${defaultSizeGib(e)} GiB.`}
             </div>
-          )}
-        </div>
+            {sizeError && <div className="field-error">{sizeError}</div>}
+          </label>
+        )}
+        {slot && sizeError && <div className="field-error">{sizeError}</div>}
+
+        {!isReserved && (
+          <div className="field">
+            <span>ISO file</span>
+            <input value={e.path} readOnly className="input-readonly" />
+            {e.file_size_bytes > 0 && (
+              <div className="field-hint">{formatBytes(e.file_size_bytes)}</div>
+            )}
+          </div>
+        )}
+
+        {typeChosen && usesPartition && (
+          <label className="field">
+            <span>Partition label</span>
+            <input
+              value={e.label}
+              maxLength={11}
+              onChange={ev => setE({ ...e, label: ev.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') })}
+              placeholder={isReserved ? 'SLOT1' : 'MINT223'}
+            />
+          </label>
+        )}
 
         {typeChosen && isPersistent && (
           <>
-            <label className="field">
-              <span>Partition label</span>
-              <input
-                value={e.label}
-                maxLength={11}
-                onChange={ev => setE({ ...e, label: ev.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') })}
-                placeholder="MINT223"
-              />
-            </label>
             <label className="field">
               <span>Boot parameters</span>
               <input
@@ -286,10 +383,13 @@ function ConfigureIso({
               <span>Username</span>
               <input
                 value={e.username}
-                onChange={ev => setE({ ...e, username: ev.target.value.replace(/\s/g, '') })}
+                onChange={ev => setE({ ...e, username: ev.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32) })}
                 placeholder="e.g. mint"
                 autoComplete="off"
               />
+              <div className="field-hint">
+                Lowercase letters, digits, _ or -, starting with a letter.
+              </div>
             </label>
             <label className="field">
               <span>Password</span>
@@ -312,10 +412,13 @@ function ConfigureIso({
           className="btn btn-primary"
           disabled={
             !typeChosen ||
-            !e.name ||
-            (isPersistent && (!e.username || !e.password))
+            (!isReserved && !e.name) ||
+            (usesPartition && (!!sizeError || !e.label)) ||
+            (isPersistent && (!USERNAME_RE.test(e.username) || !e.password)) ||
+            tooBigForFat32
           }
-          onClick={() => onSave({ ...e, size_gb: clampedSize })}
+          title={sizeError ?? (tooBigForFat32 ? 'Too large for this drive’s FAT32 free space.' : undefined)}
+          onClick={save}
         >
           {isNew ? '+ Add' : '✓ Save'}
         </button>
@@ -372,34 +475,45 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
         biosBootGb: 0,
         existingPersistentGb: 0,
         existingPartitions: [],
-        totalGb: dev.size_bytes / 1e9,
+        totalGb: dev.size_bytes / GIB,
+        freeFstype: '',
       });
     }
     setLayoutLoading(false);
   };
 
-  const driveGb = realLayout?.totalGb ?? (device?.size_bytes ?? 0) / 1e9;
+  const driveGb = realLayout?.totalGb ?? (device?.size_bytes ?? 0) / GIB;
 
   // On an existing Boot OS Pro drive, the real free space is the FREESPACE
   // partition's actual size (from the manifest) minus whatever live ISOs the
   // user has queued this session. New persistent adds carve from this, so the
   // sliders must be bounded by it — never by whole-drive arithmetic.
   const manifestFreeGb = report?.manifest
-    ? report.manifest.free_space.size_bytes / 1e9
+    ? report.manifest.free_space.size_bytes / GIB
     : 0;
   const queuedLiveGb = isos
     .filter(i => i.iso_type === 'live')
-    .reduce((s, i) => s + i.file_size_bytes / 1e9, 0);
+    .reduce((s, i) => s + i.file_size_bytes / GIB, 0);
   const queuedNewPersistentGb = isos
-    .filter(i => i.iso_type === 'persistent')
+    .filter(i => i.iso_type !== 'live' && !i.target_slot)
     .reduce((s, i) => s + i.size_gb, 0);
   const realFreeGb = isExisting
     ? Math.max(0, manifestFreeGb - queuedLiveGb - queuedNewPersistentGb)
     : freeSpaceGb;
 
-  // Space graphic values — always read from real layout + session additions
+  // Space graphic values — always read from real layout + session additions.
+  // A drive that is not a Boot OS Pro drive is erased by the write, so its old
+  // partitions take no space and are not drawn.
   const realEfiGb        = realLayout?.efiGb ?? 0;
-  const realPersistentGb = realLayout?.existingPersistentGb ?? 0;
+  const realPersistentGb = isExisting ? (realLayout?.existingPersistentGb ?? 0) : 0;
+  const freeIsFat32 = isExisting && realLayout?.freeFstype === 'vfat';
+
+  // Empty slots on an existing drive that no queued ISO is installing into.
+  const emptySlotsFor = (idx: number | null): EmptySlot[] =>
+    (isExisting ? report?.manifest?.persistent ?? [] : [])
+      .filter(p => p.state === 'empty')
+      .filter(p => !isos.some((i, j) => j !== idx && i.target_slot === p.label))
+      .map(p => ({ label: p.label, sizeGb: Math.floor(p.size_bytes / GIB) }));
   const efiDisplayGb = realEfiGb > 0 ? realEfiGb : (device ? 0.5 : 0);
 
   const addIso = async () => {
@@ -417,8 +531,13 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
     setIsoLoading(true);
     let file_size_bytes = 0;
     let arch = 'unknown';
+    let unpacked_bytes = 0;
     try { file_size_bytes = await getFileSize(path); } catch { /* non-fatal */ }
-    try { arch = await getIsoArch(path); } catch { /* non-fatal */ }
+    try {
+      const info = await getIsoInfo(path);
+      arch = info.arch;
+      unpacked_bytes = info.unpacked_bytes;
+    } catch { /* non-fatal */ }
     setIsoLoading(false);
 
     if (arch === 'aarch64') {
@@ -433,21 +552,39 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
       setArchWarning(null);
     }
 
-    const extractedGb = (file_size_bytes / 1e9) * EXTRACTED_MULTIPLIER * HEADROOM;
-    const defaultSizeGb = Math.max(Math.ceil(extractedGb) + 1, 1);
-
     const entry: IsoWriteSpec = {
       name: filename.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' '),
       path,
       label: makeLabel(filename.replace(/\.[^.]+$/, ''), isos),
-      size_gb: defaultSizeGb,
+      size_gb: 0,
       boot_params: BOOT_PARAMS[distro] ?? BOOT_PARAMS.custom,
       file_size_bytes,
+      unpacked_bytes,
       iso_type: 'persistent',
+      target_slot: '',
       username: '',
       password: '',
     };
+    entry.size_gb = defaultSizeGib(entry);
     setConfiguring(entry);
+    setEditIdx(null);
+  };
+
+  const reserveSlot = () => {
+    setArchWarning(null);
+    setConfiguring({
+      name: 'Empty slot',
+      path: '',
+      label: makeLabel('SLOT', isos),
+      size_gb: 20,
+      boot_params: '',
+      file_size_bytes: 0,
+      unpacked_bytes: 0,
+      iso_type: 'reserved',
+      target_slot: '',
+      username: '',
+      password: '',
+    });
     setEditIdx(null);
   };
 
@@ -489,6 +626,8 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
           driveGb={driveGb}
           existingPersistentGb={realPersistentGb}
           maxPersistentOverrideGb={isExisting ? manifestFreeGb - queuedLiveGb : undefined}
+          emptySlots={emptySlotsFor(editIdx)}
+          freeIsFat32={freeIsFat32}
           onSave={saveConfig}
           onCancel={() => { setConfiguring(null); setEditIdx(null); setArchWarning(null); }}
         />
@@ -561,7 +700,7 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
                   <span className="content-name">
                     {p.state === 'filled' ? (p.os_name || p.label) : `${p.label} — empty slot`}
                   </span>
-                  <span className="content-meta">persistent · {formatGb(p.size_bytes / 1e9)}</span>
+                  <span className="content-meta">persistent · {formatGb(p.size_bytes / GIB)}</span>
                 </div>
               ))}
               {report.manifest.live.map((l, i) => (
@@ -628,19 +767,28 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
             <div className="iso-main">
               <div className="iso-name">{iso.name}</div>
               <div className="iso-path">
-                {iso.path.split('/').pop()}
+                {iso.iso_type === 'reserved'
+                  ? 'Reserved for a persistent OS added later'
+                  : iso.path.split('/').pop()}
                 {iso.file_size_bytes > 0 && ` · ${formatBytes(iso.file_size_bytes)}`}
               </div>
               <div className="iso-badges">
-                {iso.iso_type === 'persistent' ? (
+                {iso.iso_type === 'persistent' && (
                   <>
                     <span className="badge badge-blue">persistent</span>
-                    <span className="badge badge-blue-dim">{iso.size_gb} GB</span>
+                    <span className="badge badge-blue-dim">{iso.size_gb} GiB</span>
+                    <span className="badge badge-gray">{iso.label}</span>
+                    {iso.target_slot && <span className="badge badge-gray">into {iso.target_slot}</span>}
+                  </>
+                )}
+                {iso.iso_type === 'reserved' && (
+                  <>
+                    <span className="badge badge-gray">empty slot</span>
+                    <span className="badge badge-blue-dim">{iso.size_gb} GiB</span>
                     <span className="badge badge-gray">{iso.label}</span>
                   </>
-                ) : (
-                  <span className="badge badge-green">live session</span>
                 )}
+                {iso.iso_type === 'live' && <span className="badge badge-green">live session</span>}
               </div>
             </div>
             <div className="iso-actions">
@@ -655,6 +803,14 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
           </svg>
           {isoLoading ? 'Reading file…' : 'Add ISO'}
         </button>
+        {device && !isExisting && (
+          <button className="add-iso-btn" onClick={reserveSlot} disabled={isoLoading}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="3" y="6" width="18" height="12" rx="2"/>
+            </svg>
+            Reserve empty slot
+          </button>
+        )}
       </div>
 
       {/* Drive space graphic — reads from REAL partition layout */}
@@ -678,24 +834,24 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
                     style={{ width: `${(efiDisplayGb / driveGb) * 100}%` }}
                     title={`EFI (${formatGb(efiDisplayGb)})`} />
                 )}
-                {/* Existing persistent partitions on drive */}
-                {(realLayout?.existingPartitions ?? [])
+                {/* Existing persistent partitions — only on a drive that is kept */}
+                {(isExisting ? realLayout?.existingPartitions ?? [] : [])
                   .filter(p => p.fstype === 'ext4')
                   .map((p, i) => (
                     <div key={`real-${i}`} className="space-seg seg-persistent-blue"
-                      style={{ width: `${(p.size_bytes / 1e9 / driveGb) * 100}%` }}
-                      title={`${p.label || 'Existing'} (${formatGb(p.size_bytes / 1e9)})`} />
+                      style={{ width: `${(p.size_bytes / GIB / driveGb) * 100}%` }}
+                      title={`${p.label || 'Existing'} (${formatGb(p.size_bytes / GIB)})`} />
                   ))
                 }
-                {/* Session-added persistent partitions */}
-                {isos.filter(i => i.iso_type === 'persistent').map((iso, i) => (
+                {/* Session-added partitions (persistent ISOs and reserved slots) */}
+                {isos.filter(i => i.iso_type !== 'live' && !i.target_slot).map((iso, i) => (
                   <div key={`new-${i}`} className="space-seg seg-persistent-blue"
                     style={{
                       width: `${(iso.size_gb / driveGb) * 100}%`,
                       opacity: 0.7,
                       backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 4px, rgba(255,255,255,0.1) 4px, rgba(255,255,255,0.1) 8px)',
                     }}
-                    title={`${iso.name} (${iso.size_gb} GB — to be written)`} />
+                    title={`${iso.name} (${iso.size_gb} GiB — to be written)`} />
                 ))}
                 {realFreeGb > 0.1 && (
                   <div className="space-seg seg-free-green"
@@ -720,7 +876,7 @@ export function ImagesStep({ device, isos, freeSpaceGb, report, isExisting, onDe
             !!report?.drift ||
             (isExisting
               ? isos.length === 0
-              : isos.filter(i => i.iso_type === 'persistent').length === 0)
+              : isos.filter(i => i.iso_type !== 'live').length === 0)
           }
           title={report?.drift ? 'Resolve the drive mismatch first — rebuild from disk or select another drive.' : undefined}
           onClick={onNext}

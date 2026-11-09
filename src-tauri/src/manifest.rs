@@ -1,3 +1,5 @@
+// Boot OS Pro — manifest.rs — build 1.0.2 — Monday 9 November 2026
+
 //! Boot OS Pro drive manifest.
 //!
 //! The manifest is the master record of everything on a Boot OS Pro drive:
@@ -19,9 +21,10 @@
 //! SECURITY: the manifest is treated as UNTRUSTED INPUT even though the app
 //! wrote it, because anyone can mount the EFI partition and edit it, or the
 //! drive may have come from another machine. No manifest value is ever
-//! interpolated into a privileged shell string. Values that feed privileged
-//! commands (labels, filenames, boot params) are sanitised on read — see
-//! `sanitize_label`, `sanitize_filename`, `sanitize_boot_params`.
+//! interpolated into a privileged shell string. Every value is sanitised on
+//! read (`sanitize_manifest`, called by `parse`). The self-hash detects
+//! corruption only — it is not a tamper check, since an editor can
+//! recompute it.
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -101,15 +104,21 @@ pub struct LiveRecord {
     pub initrd: String,
     /// Kernel boot parameters, e.g. `boot=live components quiet splash`.
     pub boot_params: String,
-    /// How GRUB locates the ISO on the FAT partition: "iso-scan", "findiso",
-    /// or "none" (family uses its own label-based param in boot_params).
+    /// How GRUB locates the ISO on the free space partition: "iso-scan",
+    /// "findiso", "archiso", or "none" (family uses its own label param).
     #[serde(default)]
     pub locate: String,
     /// ISO file size in bytes.
     pub size_bytes: u64,
+    /// Overlay initrd filename in the free space partition's `bootospro/`
+    /// folder (casper ISOs on exFAT). Not serialised when empty, so manifests
+    /// written before 1.0.19 keep a valid body hash.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub overlay: String,
 }
 
-/// The shared FAT32 free space partition that holds the live ISOs.
+/// The shared free space partition that holds the live ISOs (exFAT on new
+/// drives, FAT32 on drives made before 1.0.19).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreeSpaceRecord {
     /// Partition label, always `FREESPACE`. Empty string if no free space part.
@@ -120,7 +129,7 @@ pub struct FreeSpaceRecord {
     pub fs_uuid: String,
 }
 
-/// The 40 MB cross-platform installer partition (`BOOTOSPRO`).
+/// The cross-platform installer partition (`BOOTOSPRO`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallerRecord {
     /// Whether an installer partition exists on the drive.
@@ -231,7 +240,60 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
             "manifest body hash mismatch (expected {expected}, got {actual}) — manifest corrupt or hand-edited"
         ));
     }
-    Ok(m)
+    // The hash only proves the file is intact — anyone editing it can
+    // recompute it. Every value is cleaned before anything uses it.
+    Ok(sanitize_manifest(m))
+}
+
+/// Clean every value read from a manifest. The manifest is untrusted input:
+/// these values reach grub.cfg and privileged commands.
+fn sanitize_manifest(mut m: Manifest) -> Manifest {
+    m.drive_label = sanitize_text(&m.drive_label);
+    for p in &mut m.persistent {
+        p.label = sanitize_label(&p.label);
+        p.os_name = p.os_name.as_deref().map(sanitize_text);
+        p.kernel = sanitize_path(&p.kernel);
+        p.initrd = sanitize_paths(&p.initrd);
+        p.boot_params = sanitize_boot_params(&p.boot_params);
+        p.fs_uuid = sanitize_uuid(&p.fs_uuid);
+    }
+    for l in &mut m.live {
+        l.filename = sanitize_filename(&l.filename);
+        l.os_name = sanitize_text(&l.os_name);
+        l.kernel = sanitize_path(&l.kernel);
+        l.initrd = sanitize_paths(&l.initrd);
+        l.boot_params = sanitize_boot_params(&l.boot_params);
+        if !matches!(l.locate.as_str(), "iso-scan" | "findiso" | "archiso" | "none" | "") {
+            l.locate = "none".into();
+        }
+        l.overlay = sanitize_filename(&l.overlay);
+    }
+    m.free_space.label = sanitize_label(&m.free_space.label);
+    m.free_space.fs_uuid = sanitize_uuid(&m.free_space.fs_uuid);
+    for pkg in &mut m.installer.packages {
+        pkg.platform = sanitize_text(&pkg.platform);
+        pkg.filename = sanitize_filename(&pkg.filename);
+        pkg.version = sanitize_text(&pkg.version);
+        pkg.sha256 = pkg.sha256.chars().filter(|c| c.is_ascii_hexdigit()).take(64).collect();
+    }
+    m
+}
+
+/// Display text: printable characters only (no line breaks or other control
+/// characters), max 128.
+fn sanitize_text(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(128).collect()
+}
+
+/// Filesystem UUIDs: hex digits and dashes only, max 36.
+fn sanitize_uuid(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').take(36).collect()
+}
+
+/// One or more space-separated image paths (an initrd field may list several).
+fn sanitize_paths(raw: &str) -> String {
+    raw.split_whitespace().map(sanitize_path).filter(|p| !p.is_empty())
+        .collect::<Vec<_>>().join(" ")
 }
 
 /// Read and validate the manifest from a mounted EFI partition.
@@ -257,9 +319,14 @@ where
 {
     let json = serialize(m)?;
 
-    let pid = std::process::id();
-    let tmp = format!("/tmp/bootospro-manifest-{pid}.json");
-    std::fs::write(&tmp, &json).map_err(|e| format!("write tmp manifest: {e}"))?;
+    // Stage in a fresh private directory (mktemp -d, mode 700) — never at a
+    // predictable /tmp name, since this runs as root inside the helper.
+    let stage = crate::disk::make_temp_dir().map_err(|e| e.to_string())?;
+    let tmp = format!("{stage}/manifest.json");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(format!("stage manifest: {e}"));
+    }
 
     // Ensure the bootospro/ dir exists on EFI, then copy the file in.
     let dest_dir = format!("{efi_mnt}/bootospro");
@@ -269,7 +336,7 @@ where
     // it both the source and destination and let the caller route privilege.
     let _ = std::fs::create_dir_all(&dest_dir); // best-effort if user-writable
     let result = privileged_cp(&tmp, &dest);
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir_all(&stage);
     result
 }
 

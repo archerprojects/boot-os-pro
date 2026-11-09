@@ -1,3 +1,5 @@
+// Boot OS Pro — theme.rs — build 1.0.2 — Monday 9 November 2026
+
 use std::process::Command;
 
 #[derive(serde::Serialize)]

@@ -1,3 +1,5 @@
+// Boot OS Pro — StepBar.tsx — build 1.0.2 — Monday 9 November 2026
+
 import type { Step } from '../lib/types';
 
 const STEPS: { id: Step; label: string }[] = [

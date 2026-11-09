@@ -1,7 +1,10 @@
+// Boot OS Pro — App.tsx — build 1.0.2 — Monday 9 November 2026
+
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import type { AppState, Step, DriveReport } from './lib/types';
+import { GIB, FIXED_OVERHEAD_GIB } from './lib/units';
 import { readDriveManifest, reconcileManifest } from './lib/api';
 import { StepBar } from './components/StepBar';
 import { ImagesStep } from './components/ImagesStep';
@@ -57,8 +60,9 @@ function AboutPanel({ version }: { version: string }) {
           Boot OS Pro writes structured multiboot USB drives that boot via GRUB2 on EFI
           and legacy BIOS. Each persistent ISO gets its own ext4 partition with the OS
           squashfs extracted directly — fully writable, changes survive reboot, no
-          distro-specific overlay. Live session ISOs are copied to a shared FAT32 free
-          space partition and loopback-booted by GRUB.
+          distro-specific overlay. Live session ISOs are copied to a shared exFAT free
+          space partition, readable on Linux, Windows and macOS, and loopback-booted
+          by GRUB.
         </p>
       </div>
 
@@ -76,9 +80,9 @@ function AboutPanel({ version }: { version: string }) {
         <div className="section-label">Drive layout</div>
         <p style={{ fontSize: 12, fontFamily: 'var(--font-mono)', lineHeight: 1.8, color: 'var(--text-secondary)', marginTop: 8 }}>
           BIOS Boot (1 MiB) · EFI/ESP (512 MiB FAT32)<br/>
-          BOOTOSPRO installer (40 MiB FAT32)<br/>
-          ISO partitions (ext4, one per persistent OS)<br/>
-          FREESPACE (FAT32, live session ISOs)
+          BOOTOSPRO app copy and drivers (256 MiB FAT32)<br/>
+          ISO partitions (ext4, one per persistent OS or reserved slot)<br/>
+          FREESPACE (exFAT, live session ISOs)
         </p>
       </div>
 
@@ -120,10 +124,10 @@ export default function App() {
   const goTo   = (step: Step) => update({ step });
 
   const syncFreeSpace = (isos: typeof state.isos, device: typeof state.device) => {
-    const driveGb   = (device?.size_bytes ?? 0) / 1e9;
-    const efiGb     = 0.5;
+    const driveGb   = (device?.size_bytes ?? 0) / GIB;
+    const efiGb     = FIXED_OVERHEAD_GIB;
     const persistGb = isos
-      .filter(i => i.iso_type === 'persistent')
+      .filter(i => i.iso_type !== 'live')
       .reduce((s, i) => s + i.size_gb, 0);
     return Math.floor(Math.max(0, driveGb - efiGb - persistGb));
   };

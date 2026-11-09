@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Boot OS Pro — dev.bootospro.app.policy — build 1.0.2 — Monday 9 November 2026 -->
 <!DOCTYPE policyconfig PUBLIC
   "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
   "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
@@ -6,7 +7,7 @@
 <policyconfig>
 
   <vendor>Boot OS Pro</vendor>
-  <vendor_url>https://bootospro.dev</vendor_url>
+  <vendor_url>https://github.com/archerprojects/boot-os-pro</vendor_url>
 
   <action id="dev.bootospro.app.run-helper">
     <description>Run Boot OS Pro disk operations</description>

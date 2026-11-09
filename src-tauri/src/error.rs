@@ -1,3 +1,5 @@
+// Boot OS Pro — error.rs — build 1.0.2 — Monday 9 November 2026
+
 use serde::Serialize;
 use thiserror::Error;
 

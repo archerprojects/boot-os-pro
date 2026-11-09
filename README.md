@@ -1,6 +1,8 @@
 # Boot OS Pro
 
-**Version 1.0.0** · Tauri 2 · Rust · React 18 · Linux x86_64 · GPLv3
+*README — build 1.0.2 — Monday 9 November 2026*
+
+**Version 1.0.2** · Tauri 2 · Rust · React 18 · Linux x86_64 · GPLv3
 
 Boot OS Pro is a desktop application for creating multiboot USB connected drives that boot via GRUB2 on both EFI and legacy BIOS machines. It ships with Lean Linux and runs on any Ubuntu 24.04+, Linux Mint 22+, or Debian 13+ system.
 
@@ -19,8 +21,8 @@ https://github.com/archerprojects/boot-os-pro
 
 Boot OS Pro writes a structured, self-describing multiboot drive. Each ISO you add is either:
 
-- **Persistent** — the OS squashfs is extracted into its own dedicated ext4 partition. Boots directly by label, fully writable, changes survive reboot. Universal persistence — no casper-rw overlay, no distro-specific hooks, works across Ubuntu/Mint/Debian/Fedora/Arch families.
-- **Live session** — the ISO file is copied to a shared FAT32 free space partition and loopback-booted by GRUB. No persistence. Multiple live ISOs can coexist on one drive, added additively without reformatting.
+- **Persistent** — the OS squashfs is extracted into its own dedicated ext4 partition. Boots by filesystem UUID, fully writable, changes survive reboot. Universal persistence — no casper-rw overlay, no distro-specific hooks, works across Ubuntu/Mint/Debian/Fedora/Arch families.
+- **Live session** — the ISO file is copied to a shared exFAT free space partition (readable on Linux, Windows and macOS, no 4 GiB file limit) and loopback-booted by GRUB. No persistence. Multiple live ISOs can coexist on one drive, added additively without reformatting.
 
 ---
 
@@ -36,16 +38,16 @@ Boot OS Pro writes a structured, self-describing multiboot drive. Each ISO you a
 ## Drive layout
 
 ```
-[ BIOS Boot 1MiB ][ EFI/ESP 512MiB FAT32 ][ BOOTOSPRO 40MiB FAT32 ][ ISO1 ext4 ][ ISO2 ext4 ][ FREESPACE FAT32 ]
+[ BIOS Boot 1MiB ][ EFI/ESP 512MiB FAT32 ][ BOOTOSPRO 256MiB FAT32 ][ ISO1 ext4 ][ ISO2 ext4 ][ empty slot ext4 ][ FREESPACE exFAT ]
 ```
 
 | Partition | Purpose |
 |---|---|
 | BIOS Boot | GRUB i386-pc core for legacy BIOS boot on GPT |
 | EFI (ESP) | GRUB EFI bootloader + grub.cfg + manifest.json |
-| BOOTOSPRO | 40 MiB FAT32 installer payload — mounts on Linux, Windows, macOS |
-| ISO partitions | One ext4 per persistent OS, labelled per ISO |
-| FREESPACE | Shared FAT32 partition holding live-session ISOs as files |
+| BOOTOSPRO | 256 MiB FAT32 for the app copy and drivers — mounts on Linux, Windows, macOS (not yet populated) |
+| ISO partitions | One ext4 per persistent OS, labelled per ISO; reserved empty slots (ext4) can be added for a later OS and filled without repartitioning |
+| FREESPACE | Shared exFAT partition holding live-session ISOs as files (FAT32 on drives made by older versions; those keep the 4 GiB file limit) |
 
 The free space partition is optional — omitted when the drive is filled with persistent partitions.
 
@@ -66,7 +68,7 @@ The manifest is treated as untrusted input. All values that reach privileged com
 ## Application structure
 
 ```
-bootospro-app-V1_1/
+bootospro/
 ├── build.sh                          — version owner, assembles .deb from skeleton
 ├── .build_counter                    — auto-incremented build number
 ├── index.html                        — pre-React data-theme="dark" default
@@ -82,7 +84,8 @@ bootospro-app-V1_1/
 │   │   └── DiskManager.tsx           — partition visualiser, format/delete/wipe/scalpel ops
 │   └── lib/
 │       ├── types.ts                  — TypeScript types mirroring Rust structs
-│       └── api.ts                    — invoke wrappers for all Tauri commands
+│       ├── api.ts                    — invoke wrappers for all Tauri commands
+│       └── units.ts                  — GiB/MiB sizes, fixed overhead, FAT32 file limit
 └── src-tauri/
     ├── Cargo.toml
     ├── tauri.conf.json               — stamped with version by build.sh before compile
@@ -95,8 +98,11 @@ bootospro-app-V1_1/
         ├── disk.rs                   — device listing, partition ops, format, mount, wipe
         ├── grub.rs                   — GRUB install, grub.cfg generation (manifest projection)
         ├── squash.rs                 — squashfs detection, extraction, live-boot probing
-        ├── theme.rs                  — GTK theme detection (gsettings, returns dark: bool)
-        └── commands.rs               — all Tauri commands, write pipeline, scalpel ops
+        ├── theme.rs                  — theme detection (color-scheme first, gtk-theme fallback)
+        ├── commands.rs               — Tauri commands: read-only queries, helper job wrappers
+        ├── helper_client.rs          — launches the privileged helper, streams its progress
+        ├── jobs.rs                   — every privileged operation as a job (write, add, slots, Disk Manager)
+        └── bin/bootospro-helper.rs   — privileged helper binary (one pkexec launch per operation)
 ```
 
 ---
@@ -108,7 +114,7 @@ bootospro-app-V1_1/
 | Family | Detection |
 |---|---|
 | Ubuntu / Mint / Debian Live / KDE Neon | `casper/filesystem.squashfs` or `live/filesystem.squashfs` |
-| Fedora / RHEL / Rocky / Alma / CentOS Stream | Two-level LiveOS — `LiveOS/squashfs.img` → `rootfs.img` |
+| Fedora / RHEL / Rocky / Alma / CentOS Stream | `LiveOS/squashfs.img` — squashfs (two-level, → `rootfs.img`) or EROFS (Fedora 44), detected by content. SELinux systems relabel on first boot and restart once. |
 | Arch / Manjaro | `arch/x86_64/airootfs.sfs` |
 | Sparky / MX / antiX | `live/filesystem.squashfs` |
 
@@ -120,7 +126,7 @@ Ubuntu/Mint (casper), Debian/Sparky/MX (live-boot), Fedora/RHEL (grub2 label-bas
 
 ## Architecture detection
 
-Boot OS Pro checks the ELF architecture of each ISO's kernel before adding it. If an aarch64 (ARM) ISO is detected, a warning is shown — Boot OS Pro installs an x86_64 GRUB bootloader only. ARM64 dual-EFI support is planned for v1.1.
+Boot OS Pro checks the ELF architecture of each ISO's kernel before adding it. If an aarch64 (ARM) ISO is detected, a warning is shown — Boot OS Pro installs an x86_64 GRUB bootloader only.
 
 ---
 
@@ -155,7 +161,7 @@ These are installed automatically as `.deb` dependencies:
 | `polkitd \| policykit-1` | polkit daemon |
 | `pkexec \| policykit-1` | privilege escalation launcher |
 
-Privileged operations run through `/usr/lib/bootospro/bootospro-helper` via polkit. The helper enforces an explicit allowlist of permitted commands.
+Privileged operations run in `/usr/lib/bootospro/bootospro-helper`, a Rust binary launched once per operation via polkit — one password prompt per write, however long. Before any job it checks that the target is a USB drive the app lists and that it holds no system mount (`/`, `/boot`, `/home`, …). Cancel stops the running extraction.
 
 ---
 
@@ -179,7 +185,7 @@ cargo install tauri-cli --version "^2" --locked
 ### Build and install
 
 ```bash
-cd bootospro-app-V1_1
+cd bootospro
 ./build.sh
 sudo dpkg -i dist/bootospro_1.0.X_amd64.deb
 ```
@@ -207,7 +213,7 @@ cd src-tauri && cargo clean && cd ..
 
 ## Theming
 
-Boot OS Pro follows the Lean Linux application theming directive. Theme detection reads `gsettings org.gnome.desktop.interface gtk-theme` via a Tauri command on mount and polls every 30 seconds for runtime switching without restart. The accent color `#4b8bd4` is fixed across both themes. All surface and text colors use CSS variables — no hardcoded hex on adaptive values.
+Boot OS Pro follows the Lean Linux application theming directive. Theme detection reads `gsettings org.gnome.desktop.interface color-scheme` (falling back to the `gtk-theme` name) via a Tauri command on mount and polls every 30 seconds for runtime switching without restart. The accent color `#4b8bd4` is fixed across both themes. All surface and text colors use CSS variables — no hardcoded hex on adaptive values.
 
 ---
 
@@ -223,15 +229,23 @@ Boot OS Pro follows the Lean Linux application theming directive. Theme detectio
 - Architecture mismatch warning — aarch64 ISOs flagged before write
 - About tab — version, license, developer identity, known limitations
 
+## Tested in QEMU from a written USB stick (EFI and BIOS)
+
+- Live sessions on exFAT — Linux Mint 22.3, Arch 2026.11.01, Ubuntu 26.04.1 Desktop (6 GiB ISO)
+- Live sessions — Ubuntu 26.04.1 Server, Debian 13.7
+- Persistent Linux Mint 22.3 — boots
+- Persistent Fedora Workstation 44 (EROFS) — relabels, restarts once, reaches the login screen
+- UUID boot of persistent entries
+
 ## Implemented — confirm on hardware
 
-- UUID boot — persistent entries locate root by filesystem UUID with label fallback
-- Streaming extraction progress — `unsquashfs -percentage` piped live to the progress bar
+- Real hardware boot of an exFAT drive (the exFAT tests ran in QEMU)
 - Add persistent to existing drive (carve) — appends partitions to the existing table
+- Install into a reserved empty slot
+- Cancel during extraction
 - Manifest drift detection → Rebuild from disk reconciliation flow
-- Empty Slot scalpel — reformat one slot leaving others intact
+- Disk Manager — Format, Delete, Empty Slot, Clear Live (re-formats free space as exFAT)
 - Safe wipe — clean readable drive after wipe, filesystem selectable (fat32 default)
-- Fedora/RHEL persistent extraction — two-level LiveOS squashfs, wired with banded progress
 
 ## Known outstanding (next milestone)
 
