@@ -7,7 +7,6 @@
 Boot OS Pro is a desktop application for creating multiboot USB connected drives that boot via GRUB2 on both EFI and legacy BIOS machines. It ships with Lean Linux and runs on any Ubuntu 24.04+, Linux Mint 22+, or Debian 13+ system.
 
 ```
-Developed for Lean Linux by:
 Developer:  archerprojects
 Contact:    archer.projects@proton.me
 Maintainer: archerprojects <archer.projects@proton.me>
